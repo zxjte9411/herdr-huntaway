@@ -27,6 +27,7 @@ Left column, 268 px (folds to a 44 px rail; 76 on macOS):
   - Under each space, its agents, one 28 px row each, indented to the name: the program's icon,
     the agent's title, and on the right a spinner (`working`), a `Needs you` pill in the
     `blocked` color (`blocked`), a dot in the `done` color (`done`), nothing when `idle`.
+    The agent in the selected tab has a quiet yellow 2 px marker at the left edge of its row.
   - An agent another agent started (`hc run`) sits under that agent instead, as a tree: 1.5 px
     `input`-colored lines (`├` `└` `│`) in a 14 px cell per level, under the icon above, and its
     terminal name (`gl-228`). It is listed only there, never also as a row of its own, even when

@@ -475,6 +475,7 @@ export default class Spaces extends View {
       .filter(tab => tab.id === a.tab).map(tab => ({ space, tab }))) : [];
     const target = matches.length === 1 && matches[0].space.id === a.space ? matches[0] : null;
     const { tab } = target ?? {};
+    const activeTab = Boolean(target?.space.active && tab?.active);
     const paneMatches = tab ? panes().filter(p => p.tab === tab.id && p.pane === a.pane && p.terminal === a.address) : [];
     const canCloseTab = Boolean(a.pane && target && paneMatches.length === 1);
     const pic = program?.icon ? (program.tint ? svg(program.icon).size(13).flex_none().text_color(t.dim) : image(program.icon).size(13).flex_none()) : div().size(5).mx(4).flex_none().rounded(3).bg(t.dim);
@@ -483,6 +484,7 @@ export default class Spaces extends View {
       .hover((s) => s.bg(t.hover).text_color(t.foreground)).active((s) => s.opacity(0.75))
       .when(depth === 0, el => el
         .relative()
+        .when(activeTab, row => row.child(div().absolute().left(27).top(8).bottom(8).w(2).rounded(1).bg(t.ansi3 + "80")))
         .when(this.agentPressed === a.address && this.agentOver !== a.address, row => row.opacity(0.55).transition("opacity", { duration: 140, easing: "ease-out" }))
         .child(div().absolute().left(7).right(7).bottom(0).h(2).rounded(1).bg(t.accent)
           .opacity(this.agentPressed !== null && this.agentOver === a.address && this.agentPressed !== a.address ? 1 : 0)
