@@ -13,8 +13,8 @@
 // receives its script as -EncodedCommand (UTF-16), so paths with spaces,
 // quotes or non-ASCII characters never pass through a command line.
 import * as fs from "fs/promises";
-import { exec, hc, home, readTextFile, writeTextFile, appHome } from "herdr";
-import { norm, join, dirname, basename, extname, isWindows, isMac, localWindows, underHome, display, key, winPath, setRemoteHome } from "./paths.js";
+import { exec, readTextFile, writeTextFile, appHome } from "herdr";
+import { norm, join, dirname, basename, extname, isWindows, isMac, localWindows, underHome, display, key } from "./paths.js";
 
 export const MAX_PER_FOLDER = 5000;
 
@@ -56,31 +56,8 @@ export async function sh(script, args, { on = null, timeout = 30000 } = {}) {
   if (r.code !== 0) throw new Error(r.stderr.trim() || r.stdout.trim() || "Command failed");
   return r.stdout;
 }
-/** Another machine runs Windows when its paths are spelled that way: it has no sh, so everything
- *  there goes to PowerShell at once (trying sh first costs a round trip each time). */
-const remoteWindows = (on, path) => Boolean(on) && winPath(path);
-
-const remoteHomes = new Map();
-/**
- * Another machine's home folder (`path`: any path there, to tell its kind), asked once and kept
- * in localStorage; paths.js friendly() uses it from then on. null when it can't say.
- */
-export function remoteHome(on, path) {
-  if (!on) return Promise.resolve(null);
-  let saved = null;
-  try { saved = localStorage.getItem(`home:${on}`); } catch {}
-  if (saved) { setRemoteHome(on, saved); return Promise.resolve(saved); }
-  if (!remoteHomes.has(on)) {
-    remoteHomes.set(on, (async () => {
-      const h = (remoteWindows(on, path) ? await powershell("[Console]::Out.Write($HOME)", { on }) : await sh('printf "%s" "$HOME"', [], { on })).trim();
-      if (!h) throw new Error("No home folder");
-      try { localStorage.setItem(`home:${on}`, h); } catch {}
-      setRemoteHome(on, h);
-      return h;
-    })().catch(() => { remoteHomes.delete(on); return null; }));
-  }
-  return remoteHomes.get(on);
-}
+/** Remote Windows machines have no sh. */
+const noShell = e => /cannot start sh|program not found|not recognized/i.test(String(e));
 
 // ---- listing ---------------------------------------------------------------
 
@@ -217,14 +194,16 @@ async function listByProgram(paths, on) {
       const batch = [];
       let size = 0;
       while (i < paths.length && (batch.length === 0 || size + paths[i].length < 2500)) { size += paths[i].length; batch.push(paths[i++]); }
-      parsePowerShell(await powershell(PS_LIST(batch.map(p => display(p, on))), { on }), out);
+      parsePowerShell(await powershell(PS_LIST(batch.map(p => display(p, null))), { on }), out);
     }
   };
   if (localWindows(on)) {
     const left = await listByCmd(paths, out);
     if (left.length) await viaPowerShell(left);
-  } else if (remoteWindows(on, paths[0])) await viaPowerShell(paths);
-  else parseShell(await sh(SH_LIST, paths, { on }), out);
+  } else {
+    try { parseShell(await sh(SH_LIST, paths, { on }), out); }
+    catch (e) { if (on && noShell(e)) await viaPowerShell(paths); else throw e; }
+  }
   // PowerShell reports Windows spelling; map back to the requested paths.
   const result = new Map();
   for (const p of paths) result.set(p, out.get(norm(p)) ?? [...out.entries()].find(([k]) => key(k, on) === key(p, on))?.[1] ?? { entries: [], error: "Cannot read this folder" });
@@ -281,8 +260,11 @@ export async function fileTimes(paths, on) {
   const out = new Map();
   let text;
   try {
-    if (localWindows(on) || remoteWindows(on, paths[0])) text = await powershell(PS_TIMES(paths.map(p => display(p, on))), { on });
-    else text = await sh(SH_TIMES, paths, { on });
+    if (localWindows(on)) text = await powershell(PS_TIMES(paths.map(p => display(p, null))));
+    else {
+      try { text = await sh(SH_TIMES, paths, { on }); }
+      catch (e) { if (on && noShell(e)) text = await powershell(PS_TIMES(paths.map(p => display(p, null))), { on }); else throw e; }
+    }
   } catch { return out; }
   let current = null;
   for (const line of text.split(/\r?\n/)) {
@@ -329,7 +311,7 @@ export async function fileIndex(root, on, gitTop) {
     }
     return { files: files.slice(0, INDEX_LIMIT), limited: files.length >= INDEX_LIMIT || queue.length > 0 };
   }
-  if (localWindows(on) || remoteWindows(on, root)) {
+  if (localWindows(on)) {
     const skip = [...SKIP].map(psq).join(",");
     const text = await powershell(`$skip = [Collections.Generic.HashSet[string]]::new([string[]]@(${skip}), [StringComparer]::OrdinalIgnoreCase)
       $root = ${psq(display(root, on))}; $q = [Collections.Generic.Queue[string]]::new(); $q.Enqueue($root); $n = 0
@@ -382,23 +364,25 @@ export async function gitTop(root, on) {
     return r.code === 0 ? norm(r.stdout.trim()) : null;
   } catch { return null; }
 }
+export async function gitBranch(top, on) {
+  try {
+    const r = await exec("git", [...GIT, "branch", "--show-current"], { cwd: top, on, timeout: 10000 });
+    return r.code === 0 ? r.stdout.trim() || null : null;
+  } catch { return null; }
+}
 /**
  * Git status: `files` is Map(relative path -> mark), marks M modified, A added, D deleted,
  * R renamed, U untracked, C conflict, I ignored; paths ending in "/" are folders. With them the
- * branch (null when detached), its upstream (`origin/main`) and how far ahead and behind it is:
- * all from the status's own branch line, so no other git call is needed.
+ * branch's upstream (`origin/main`) and how far ahead and behind it the branch is.
  */
 export async function gitStatus(top, on) {
   const r = await exec("git", [...GIT, "status", "--porcelain=v1", "-z", "--branch", "--no-renames", "--untracked-files=normal", "--ignored=matching"], { cwd: top, on, timeout: 20000 });
   if (r.code !== 0) return null;
-  const files = new Map(), out = { files, branch: null, upstream: null, ahead: 0, behind: 0 };
+  const files = new Map(), out = { files, upstream: null, ahead: 0, behind: 0 };
   let n = 0;
   for (const entry of r.stdout.split("\0")) {
-    // "## main...origin/main [ahead 2, behind 1]", "## main", "## No commits yet on main",
-    // "## HEAD (no branch)".
+    // "## main...origin/main [ahead 2, behind 1]"
     if (entry.startsWith("## ")) {
-      const head = entry.slice(3).replace(/^(No commits yet|Initial commit) on /, "");
-      out.branch = /^HEAD \(no branch\)/.test(head) ? null : head.split(/\.\.\.| \[/)[0].trim() || null;
       const m = /^## .*?(?:\.\.\.(\S+))?(?: \[(.*)\])?$/.exec(entry);
       out.upstream = m?.[1] ?? null;
       out.ahead = Number(/ahead (\d+)/.exec(m?.[2] ?? "")?.[1] ?? 0);
@@ -525,53 +509,6 @@ export async function cacheImage(path, on, dark = true) {
   if (/\.svg$/i.test(name)) await resolveSvgVars(join(dir, name), dark);
   return `${CACHE}/${name}`;
 }
-// Another machine's image comes over as base64 in exec's output, which from another machine fails
-// between 6 and 7 MB (measured; not the 8 MiB said for this one): up to 4.4 MB fits (5.9 MB of
-// base64). Up to 2 MB it is fetched when the file opens; bigger ones wait for a click; larger
-// still can only be downloaded (scp).
-export const REMOTE_IMAGE_AUTO = 2e6, REMOTE_IMAGE_MAX = 4.4e6;
-const B64_PART = 1000000; // characters per part file (writeTextFile takes at most 1 MiB)
-
-/**
- * Copies a file from another machine to `to` here, if it is at most `limit` bytes: one call there
- * prints its size, then its bytes in base64; here the text goes into a file and the system's own
- * tool decodes it (fs.writeFile can't write bytes). Resolves to { size, copied }.
- */
-async function copyFromRemote(path, on, to, limit) {
-  const text = remoteWindows(on, path)
-    ? await powershell(`$f = Get-Item -LiteralPath ${psq(display(path, on))}; [Console]::Out.Write([string]$f.Length + "\`n")
-      if ($f.Length -le ${limit}) { [Console]::Out.Write([Convert]::ToBase64String([IO.File]::ReadAllBytes($f.FullName))) }`, { on, timeout: 60000 })
-    : await sh('n=$(wc -c < "$1") || exit 1; printf "%s\\n" $n; [ "$n" -le "$2" ] && base64 < "$1" | tr -d "\\n\\r"; true', [path, String(limit)], { on, timeout: 60000 });
-  const cut = text.indexOf("\n"), size = Number(text.slice(0, cut).trim());
-  if (!Number.isFinite(size)) throw new Error("Could not read the image");
-  if (size > limit) return { size, copied: false };
-  // writeTextFile takes at most 1 MiB: the base64 goes into numbered parts, joined when decoding.
-  const data = text.slice(cut + 1).trim(), parts = [];
-  try {
-    for (let i = 0; i < data.length || !parts.length; i += B64_PART) {
-      const part = `${to}.b64.${parts.length}`;
-      parts.push(part);
-      await writeTextFile(part, data.slice(i, i + B64_PART), null);
-    }
-    if (isWindows()) await powershell(`[IO.File]::WriteAllBytes(${psq(display(to, null))}, [Convert]::FromBase64String(-join @(${parts.map(p => `[IO.File]::ReadAllText(${psq(display(p, null))})`).join(",")})))`);
-    else await sh('out=$1; shift; cat "$@" | { base64 -d 2>/dev/null || base64 -D; } > "$out"', [to, ...parts]);
-  } finally { for (const p of parts) await fs.unlink(p).catch(() => {}); }
-  return { size, copied: true };
-}
-
-/**
- * Another machine's image, copied into the cache when it is at most `limit` bytes: { rel } then,
- * else { size } (not copied; up to REMOTE_IMAGE_MAX it can be asked for with a larger limit).
- */
-export async function cacheRemoteImage(path, on, dark = true, limit = REMOTE_IMAGE_AUTO) {
-  const dir = await cacheDir(), name = cacheName(path, extname(path)), to = join(dir, name);
-  const r = await copyFromRemote(path, on, to, Math.min(limit, REMOTE_IMAGE_MAX));
-  if (!r.copied) return { size: r.size };
-  if (!(await fs.exists(to))) throw new Error("Could not read the image");
-  if (/\.svg$/i.test(name)) await resolveSvgVars(to, dark);
-  return { rel: `${CACHE}/${name}` };
-}
-
 /** The size of an image already in the cache, or null. */
 export async function cachedImageSize(rel) {
   try { return imageSize(await fs.readFile(join(norm(appHome()), rel))); } catch { return null; }
@@ -624,30 +561,23 @@ export function imageSize(bytes) {
  * Returns a Map from each source to { rel, size } or { error }.
  */
 export async function cacheMarkdownImages(sources, fileDir, on, dark = true) {
-  const out = new Map(), jobs = [], remote = [], dir = await cacheDir();
+  const out = new Map(), jobs = [], dir = await cacheDir();
   for (const src of sources) {
     let from = src, ext;
     if (/^https?:\/\//i.test(src)) {
       ext = /\.(png|jpe?g|gif|webp|svg|bmp)(?:[?#]|$)/i.exec(src)?.[1] ?? (/shields\.io|badge|\.svg/i.test(src) ? "svg" : "img");
     } else {
+      if (on) { out.set(src, { error: "Images are shown only for files on this computer" }); continue; }
       let path = decodeURIComponent(src.replace(/^file:\/\/\/?/i, "").replace(/[?#].*$/, ""));
       path = /^([a-z]:)?[\\/]/i.test(path) ? norm(path) : norm(join(fileDir, path));
       const parts = [];
       for (const part of path.split("/")) { if (part === "..") parts.pop(); else if (part !== ".") parts.push(part); }
       from = parts.join("/"); ext = extname(from);
     }
-    const name = cacheName(src, ext), job = { src, from, to: join(dir, name), rel: `${CACHE}/${name}` };
-    // Another machine's pictures come over one by one, those up to REMOTE_IMAGE_AUTO only.
-    (on && !/^https?:/i.test(src) ? remote : jobs).push(job);
+    const name = cacheName(src, ext);
+    jobs.push({ src, from, to: join(dir, name), rel: `${CACHE}/${name}` });
   }
-  for (const job of remote) {
-    try {
-      const r = await copyFromRemote(job.from, on, job.to, REMOTE_IMAGE_AUTO);
-      if (r.copied) jobs.push({ ...job, done: true });
-      else out.set(job.src, { error: `Image too large to fetch (${(r.size / 1e6).toFixed(1)} MB)` });
-    } catch { out.set(job.src, { error: "Image file not found" }); }
-  }
-  try { await fill(jobs.filter(j => !j.done)); } catch {}
+  try { await fill(jobs); } catch {}
   for (const job of jobs) {
     try {
       let bytes = await fs.readFile(job.to);
@@ -670,8 +600,8 @@ export async function createFile(path, on) {
     try { await writeTextFile(path, "", null); return; }
     catch (e) { throw new Error(/stale|exist|snapshot|changed outside/i.test(String(e)) ? "A file or folder with this name already exists" : String(e?.message ?? e)); }
   }
-  if (remoteWindows(on, path)) await powershell(`if (Test-Path -LiteralPath ${psq(display(path, on))}) { throw "A file or folder with this name already exists" }; New-Item -ItemType File -Path ${psq(display(path, on))} | Out-Null`, { on });
-  else await sh('[ -e "$1" ] && { echo "A file or folder with this name already exists" >&2; exit 1; }; : > "$1"', [path], { on });
+  try { await sh('[ -e "$1" ] && { echo "A file or folder with this name already exists" >&2; exit 1; }; : > "$1"', [path], { on }); }
+  catch (e) { if (noShell(e)) await powershell(`if (Test-Path -LiteralPath ${psq(path)}) { throw "A file or folder with this name already exists" }; New-Item -ItemType File -Path ${psq(path)} | Out-Null`, { on }); else throw e; }
 }
 
 export async function createFolder(path, on) {
@@ -679,8 +609,8 @@ export async function createFolder(path, on) {
     await powershell(`$p = ${psq(display(path, on))}; if (Test-Path -LiteralPath $p) { throw "A file or folder with this name already exists" }; [void][IO.Directory]::CreateDirectory($p)`);
     return;
   }
-  if (remoteWindows(on, path)) await powershell(`$p = ${psq(display(path, on))}; if (Test-Path -LiteralPath $p) { throw "A file or folder with this name already exists" }; [void][IO.Directory]::CreateDirectory($p)`, { on });
-  else await sh('[ -e "$1" ] && { echo "A file or folder with this name already exists" >&2; exit 1; }; mkdir -- "$1"', [path], { on });
+  try { await sh('[ -e "$1" ] && { echo "A file or folder with this name already exists" >&2; exit 1; }; mkdir -- "$1"', [path], { on }); }
+  catch (e) { if (on && noShell(e)) await powershell(`if (Test-Path -LiteralPath ${psq(path)}) { throw "A file or folder with this name already exists" }; [void][IO.Directory]::CreateDirectory(${psq(path)})`, { on }); else throw e; }
 }
 
 export async function rename(path, newPath, on) {
@@ -694,10 +624,8 @@ export async function rename(path, newPath, on) {
     return;
   }
   const guard = caseOnly ? "" : '[ -e "$2" ] && { echo "A file or folder with this name already exists" >&2; exit 1; }; ';
-  if (remoteWindows(on, path)) await powershell(`$a = ${psq(display(path, on))}; $b = ${psq(display(newPath, on))}
-      ${caseOnly ? "" : 'if (Test-Path -LiteralPath $b) { throw "A file or folder with this name already exists" }'}
-      Move-Item -LiteralPath $a -Destination $b`, { on });
-  else await sh(`${guard}mv -- "$1" "$2"`, [path, newPath], { on });
+  try { await sh(`${guard}mv -- "$1" "$2"`, [path, newPath], { on }); }
+  catch (e) { if (on && noShell(e)) await powershell(`Move-Item -LiteralPath ${psq(path)} -Destination ${psq(newPath)}`, { on }); else throw e; }
 }
 
 /** Moves to the Recycle Bin / Trash where there is one; remote machines delete for good. */
@@ -720,39 +648,9 @@ export async function remove(path, dir, on) {
   if (!on) {
     try { await sh('command -v gio >/dev/null && gio trash -- "$1"', [path], { timeout: 120000 }); return "trash"; } catch {}
   }
-  if (remoteWindows(on, path)) await powershell(`Remove-Item -LiteralPath ${psq(display(path, on))} -Recurse -Force`, { on, timeout: 120000 });
-  else await sh('rm -rf -- "$1"', [path], { on, timeout: 120000 });
+  try { await sh('rm -rf -- "$1"', [path], { on, timeout: 120000 }); }
+  catch (e) { if (on && noShell(e)) await powershell(`Remove-Item -LiteralPath ${psq(path)} -Recurse -Force`, { on, timeout: 120000 }); else throw e; }
   return "deleted";
-}
-
-/** "name (2).ext" for the second copy of "name.ext" (a folder: "name (2)"). */
-const numbered = (name, n, dir) => {
-  const dot = dir ? -1 : name.lastIndexOf(".");
-  return dot > 0 ? `${name.slice(0, dot)} (${n})${name.slice(dot)}` : `${name} (${n})`;
-};
-
-/**
- * Copies another machine's file or folder into this computer's Downloads folder with scp, through
- * the machine's ssh target (`hc machine ls`): keys or an agent only (BatchMode, never a password
- * prompt), no size limit. A name already there gets " (2)", " (3)", …. Resolves to where it went.
- */
-export async function download(path, on, dir) {
-  const r = await hc(["machine", "ls", "--json"]);
-  let machine = null;
-  try { machine = (JSON.parse(r.stdout).machines ?? []).find(m => m.name === on) ?? null; } catch {}
-  if (!machine?.target || machine.via) throw new Error(`${on} can't be reached with scp`);
-  const downloads = join(norm(home()), "Downloads"), name = basename(path);
-  try { await fs.mkdir(downloads, { recursive: true }); } catch {}
-  let dest = join(downloads, name);
-  for (let n = 2; await fs.exists(dest); n++) dest = join(downloads, numbered(name, n, dir));
-  const res = await exec("scp", ["-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", ...(dir ? ["-r"] : []),
-    `${machine.target}:${path}`, display(dest, null)], { timeout: 600000 });
-  if (res.code !== 0) {
-    // OpenSSH's warnings start with "**"; the reason is the last other line.
-    const why = res.stderr.split(/\r?\n/).filter(l => l.trim() && !l.startsWith("**")).pop();
-    throw new Error(why?.trim() || "scp failed");
-  }
-  return dest;
 }
 
 export async function reveal(path, on) {

@@ -15,12 +15,12 @@
           "size": {
             "px": 44
           },
-          "window_drag": true,
           "border": {
             "width": 1,
             "color": "#ffffff1f"
           },
-          "radius": 14
+          "radius": 14,
+          "window_drag": true
         },
         {
           "id": "sidebar-lists",
@@ -105,7 +105,7 @@
                     "height": 30,
                     "position": "top"
                   },
-                  "background": "background",
+                  "background": "#21252bcc",
                   "border": {
                     "width": 1,
                     "color": "#ffffff1f"
@@ -140,6 +140,13 @@
                       "type": "block",
                       "content": {
                         "mod": "huntaway-changes"
+                      }
+                    },
+                    {
+                      "id": "graph",
+                      "type": "block",
+                      "content": {
+                        "mod": "git-graph"
                       }
                     }
                   ],
@@ -181,12 +188,16 @@
     "fit": "cover"
   },
   "padding": 12,
-  "gap": 12,
+  "theme": {
+    "light": "paper",
+    "dark": "atom-one-dark"
+  },
   "terminal_padding": [
     16,
     14
   ],
   "terminal_opacity": 0,
+  "gap": 12,
   "titlebar": "none",
   "traffic_lights": [
     26,

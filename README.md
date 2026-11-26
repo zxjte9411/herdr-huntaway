@@ -125,6 +125,32 @@ Then:
 
 `Ctrl+Shift+L` switches back to Herdr's own layouts. To update, `git pull` and copy again.
 
+## Using this fork from a checkout
+
+The checkout and the Herdr app home (`~/.config/herdr-app`) are separate ordinary files, not a
+live link: editing one does not update the other. To track changes, edit files in this repository,
+then manually copy the intended layout and Huntaway mod folders back to the app home. For example:
+
+```sh
+r=/path/to/herdr-huntaway; h=~/.config/herdr-app
+cp "$r/huntaway/layouts/huntaway.json" "$h/layouts/"
+cp -R "$r"/huntaway/mods/huntaway-* "$h/mods/"
+```
+
+Copy only the Huntaway layout and mod folders you intend to update. Do not copy the whole app
+home, `settings.json`, unrelated mods, or `layouts/.state`; the installed layout may also be
+rewritten at runtime, so make tracked layout edits in this checkout, not by copying the app-home
+layout back into the repository. This is a manual copy workflow; the checkout does not sync
+automatically.
+
+The current layout directly references `huntaway-changes`, `huntaway-chrome`, `huntaway-files`,
+`huntaway-pane`, `huntaway-spaces`, `huntaway-status`, `huntaway-tabs`, and the independent
+`git-graph` mod. `git-graph` is not included here and must be installed separately. The layout's
+Huntaway mods also use `huntaway-inbox` (the tab bar shows its bell when installed) and
+`huntaway-newspace-upstream` (opened by the Spaces add button); both are included under
+`huntaway/mods/`. They also use Herdr-shipped mods such as `picker`, `machine-add`, `menu`,
+`confirm`, and `new-menu`.
+
 ## Good to know
 
 - The wallpaper and card edges follow your theme. To use your own picture or a plain color, change `background` at the bottom of `layouts/huntaway.json`.

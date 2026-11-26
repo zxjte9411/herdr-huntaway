@@ -5,6 +5,7 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import { spaces, panes, agents, run, openOverlay, theme, window, shared, layout, settings, appHome, readTextFile, watchFolder } from "herdr";
+import { tabLabel } from "./title-label.js";
 
 // Frosted glass on dark themes: card fills let the blurred wallpaper through. Light themes stay
 // nearly solid, so terminal text keeps its contrast on white.
@@ -111,8 +112,9 @@ export default class Tabs extends View {
 
     const info = c => {
       const ps = panes().filter(p => p.tab === c.id);
-      const program = ps.find(p => p.program?.agent)?.program ?? ps[0]?.program;
-      const name = /^tb\d+$/.test(c.name) ? program?.name ?? "Terminal" : c.name;
+      const lead = ps.find(p => p.program?.agent) ?? ps.find(p => p.terminal) ?? ps[0];
+      const program = lead?.program;
+      const name = tabLabel(c, lead);
       return { program, name: c.zoomed ? `${name} Z` : name };
     };
     // Mods can't measure text: about 6.4 px a character at 12.5 px.
@@ -132,7 +134,8 @@ export default class Tabs extends View {
       const glow = easing => div().absolute().top(0).left(0).size_full().rounded(RADIUS - INSET).bg(t.blocked)
         .loop("opacity", { from: 0.02, to: 0.2, period: 2200, easing });
       return h_flex().id(`tab-${c.id}`).relative().h_full().px(compact ? 10 : 13).gap(7).items_center().flex_none().rounded(RADIUS - INSET)
-        .text_size(12.5).text_color(on ? lit : t.muted).when(on, el => el.font_medium())
+        .text_size(12.5).text_color(on ? lit : t.muted)
+        .when(on, el => el.font_medium().bg(t.raised).border(1).border_color(lit + "59"))
         .when(compact, el => el.tooltip(name)).when(faded, el => el.opacity(0.45))
         .when(this.dragging() && this.pressed === i, el => el.opacity(0.4))
         .on_mouse_move((_e, cx) => { if (this.pressed !== null && this.over !== i) { this.over = i; cx.notify(); } })
@@ -154,15 +157,7 @@ export default class Tabs extends View {
         .when(on, el => el.child(div().id(`close-${c.id}`).flex_none().p(2).rounded(4).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
           .on_mouse_down("left", stop).on_click((_e, cx) => { cx.stop_propagation(); run("tab.close", { id: c.id }); }).child(svg("mods/pane/close.svg").size(12))));
     };
-    // Where the selection goes: after the measured widths of the tabs before the active one.
     const visible = shown.slice(fit.from, fit.to);
-    const at = visible.findIndex(c => c.active);
-    let x = INSET;
-    for (let k = 0; k < at; k++) x += (this.widths[visible[k].id] ?? width(visible[k], fit.compact)) + TAB_GAP;
-    const selW = at >= 0 ? this.widths[visible[at].id] ?? width(visible[at], false) : 0;
-    const selection = div().id("tab-selection").absolute().top(INSET).bottom(INSET).left(x).w(selW).rounded(RADIUS - INSET)
-      .bg(t.raised).border(1).border_color(lit + "59")
-      .transition("left", SLIDE).transition("width", SLIDE);
     // While dragging, a line slides to where the tab will land: after the hovered tab when
     // moving right, before it when moving left.
     const before = k => { let px = INSET; for (let j = 0; j < k; j++) px += (this.widths[visible[j].id] ?? width(visible[j], fit.compact)) + TAB_GAP; return px; };
@@ -176,7 +171,6 @@ export default class Tabs extends View {
       }
     }
     const group = card(h_flex().id("tab-group").relative().h_full().min_w(0).p(INSET).gap(TAB_GAP).items_center())
-      .when(at >= 0, el => el.child(selection))
       .when(Boolean(marker), el => el.child(marker))
       .children(visible.map((c, k) => {
         const i = fit.from + k;
@@ -192,7 +186,7 @@ export default class Tabs extends View {
       ? Math.max(0, (root.traffic_lights[0] + 64) / settings().zoom - (sidebar?.hidden ? 0 : sidebar?.size?.px ?? 0))
       : 0;
     const panel = find(root, "panel"), body = find(root, "panel-body");
-    const enabled = shared("workspace.panels") ?? ["files", "changes"];
+    const enabled = [...(shared("workspace.panels") ?? ["files", "changes"]), "graph"];
     this.syncPanel(space, panel, body, enabled);
     // The right side mirrors the tabs: the bell and the panels share one segmented card, and the
     // open panel is the same lifted selection, sliding between Files and Changes.
@@ -236,7 +230,7 @@ export default class Tabs extends View {
         .child(div().flex_none().child(String(waiting.length)));
     };
     const bell = !this.inbox ? null : top ? alertBell() : segButton("inbox", svg(`mods/${INBOX}/bell.svg`).size(15), "Agents waiting on you", openInbox);
-    const panelIds = ["files", "changes"].filter(id => enabled.includes(id));
+    const panelIds = ["files", "changes", "graph"].filter(id => enabled.includes(id));
     const openPanel = panel && !panel.hidden ? panelIds.indexOf(body?.active) : -1;
     // Where the panel selection sits: after the bell (its width changes with the count) and the buttons before it.
     const bellW = !bell ? 0 : top ? (this.bellW ?? 48) : SEG;
@@ -250,7 +244,7 @@ export default class Tabs extends View {
       .on_mouse_move(e => { if (e.bounds) this.actionsAt = e.bounds; })
       .when(openPanel >= 0, el => el.child(panelSelection))
       .when(Boolean(bell), el => el.child(top ? bell.on_size_change((sz, cx) => { const n = Math.round(sz.width); if (n !== this.bellW) { this.bellW = n; cx.notify(); } }) : bell))
-      .children(panelIds.map(id => id === "files" ? panelButton("files", "Files", "mods/files/file.svg") : panelButton("changes", "Changes", "mods/changes/changes.svg")))
+      .children(panelIds.map(id => id === "files" ? panelButton("files", "Files", "mods/files/file.svg") : id === "changes" ? panelButton("changes", "Changes", "mods/changes/changes.svg") : panelButton("graph", "Git", "mods/git-graph/icons/graph.svg")))
       .when(Boolean(w?.buttons), el => el.when(Boolean(bell) || panelIds.length > 0, el => el.child(div().w(1).h(16).mx(3).flex_none().bg(t.border)))
         .child(winButton("minimize", w.platform === "windows" ? svg("mods/huntaway-tabs/win-min.svg").size(16) : "−", () => run("window.minimize")))
         .child(winButton("maximize", w.platform === "windows" ? svg(`mods/huntaway-tabs/${w.maximized ? "win-restore" : "win-max"}.svg`).size(16) : "□", () => run("window.maximize")))

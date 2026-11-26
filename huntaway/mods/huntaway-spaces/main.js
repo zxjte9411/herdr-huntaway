@@ -7,6 +7,7 @@
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, machines, panes, agents, terminals, setAgentOrder, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
+import { agentTreeBySpace, reorderAgentRoots } from "./agent-tree.js";
 
 // Frosted glass on dark themes: card fills let the blurred wallpaper through. Light themes stay
 // nearly solid, so terminal text keeps its contrast on white.
@@ -33,65 +34,8 @@ function place(s, ps) {
 const rowHeight = ({ tree }) => (tree ? 32 : 36);
 
 // A space's agents sit under it, one row each: the agents list lives here, not in a card of its own.
-// An agent another agent started (`hc run`, its `parent`) sits under that one with tree lines,
-// and only there, even when it has a pane of its own. Started agents without a pane
-// (`hc run --bg`) are listed there too.
 const AGENT_H = 28;
 const cleanTitle = (s) => (s ?? "").replace(/^[^\p{L}\p{N}~/]+/u, "").trim();
-// A pane-less sub-agent's raw word, error counting as blocked. It's never done: it reports
-// to its parent, and the parent's done is the news.
-const kidStatus = (s) => (s === "error" ? "blocked" : s === "done" ? "idle" : s);
-// space -> rows { a, lines, sub, paneless }, each top agent followed by its tree, depth first.
-function agentsBySpace() {
-  const listed = agents(), all = terminals();
-  const byAddr = new Map(listed.map((a) => [a.address, a]));
-  const term = new Map(all.map((k) => [k.address, k]));
-  const paneless = all.filter((k) => !byAddr.has(k.address) && k.state === "live" && k.program?.agent && k.parent);
-  const shown = new Set([...byAddr.keys(), ...paneless.map((k) => k.address)]);
-  // The nearest ancestor that is drawn (a plain shell between them doesn't count).
-  const lead = (addr) => {
-    const seen = new Set([addr]);
-    for (let p = term.get(addr)?.parent; p && !seen.has(p); p = term.get(p)?.parent) {
-      if (shown.has(p)) return p;
-      seen.add(p);
-    }
-    return null;
-  };
-  // Whether a line of drawn ancestors reaches an agent with a pane.
-  const rooted = (addr) => {
-    const seen = new Set();
-    for (let p = addr; p && !seen.has(p); p = lead(p)) { if (byAddr.has(p)) return true; seen.add(p); }
-    return false;
-  };
-  const kids = new Map();
-  const tops = [];
-  for (const a of listed) {
-    const p = lead(a.address);
-    if (p && rooted(p)) { if (!kids.has(p)) kids.set(p, []); kids.get(p).push(a); } else tops.push(a);
-  }
-  for (const k of paneless) {
-    const p = lead(k.address);
-    if (p && rooted(p)) { if (!kids.has(p)) kids.set(p, []); kids.get(p).push({ ...k, paneless: true }); }
-  }
-  const tree = (addr, lead, seen) => {
-    const list = (kids.get(addr) ?? []).filter((k) => !seen.has(k.address));
-    return list.flatMap((k, i) => {
-      const last = i === list.length - 1;
-      seen.add(k.address);
-      return [
-        { a: k, lines: [...lead, last ? "└" : "├"], sub: true, paneless: Boolean(k.paneless), name: term.get(k.address)?.name },
-        ...tree(k.address, [...lead, last ? "" : "│"], seen),
-      ];
-    });
-  };
-  tops.sort((a, b) => a.tab_index - b.tab_index || a.seq - b.seq);
-  const by = new Map();
-  for (const a of tops) {
-    if (!by.has(a.space)) by.set(a.space, []);
-    by.get(a.space).push({ a, lines: [], sub: false, paneless: false }, ...tree(a.address, [], new Set([a.address])));
-  }
-  return by;
-}
 function agentName(a) {
   const title = cleanTitle(a.title);
   const isPath = /^[~/]|^[A-Za-z]:[\\/]/.test(title);
@@ -147,6 +91,9 @@ export default class Spaces extends View {
     this.reconnecting = JSON.parse(localStorage.getItem("machines.reconnecting") ?? "{}");
     for (const state of Object.values(this.reconnecting)) state.busy = false;
     this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]"));
+    this.agentOrders = JSON.parse(localStorage.getItem("agents.orders") ?? "{}");
+    this.agentPressed = null;
+    this.agentOver = null;
     this.refreshMachines(cx);
     cx.timer.every(15000, cx => this.refreshMachines(cx));
     // Refresh only when the refs could have changed (see `due`).
@@ -374,24 +321,11 @@ export default class Spaces extends View {
     return out.filter(r => this.shown.has(r.w.id));
   }
 
-  // Where the selected space's row is, for the sliding selection: only in the plain list
-  // (no machine headers), where every row's height is known. null: draw it on the row.
-  selectedSlot(collapsed) {
-    const rows = this.ordered();
-    if (rows.some(r => r.w.machine) || this.machines.length || Object.keys(this.reconnecting).length) return null;
-    let y = 0;
-    for (const r of rows) {
-      const h = collapsed ? RAIL_H : rowHeight(r);
-      if (r.w.active) return { y, h };
-      y += h + (collapsed ? 0 : (this.byAgents.get(r.w.id)?.length ?? 0) * AGENT_H);
-    }
-    return null;
-  }
-
   // The rows, under a header per machine once one isn't this computer.
   grouped(t, collapsed) {
     const rows = this.ordered();
-    const draw = (r) => (collapsed ? [this.compact(r, t)] : [this.row(r, t), ...(this.byAgents.get(r.w.id) ?? []).map(a => this.agentRow(a, t))]);
+    const drawAgents = (nodes, depth = 0) => nodes.flatMap(n => [this.agentRow(n.agent, t, depth), ...drawAgents(n.children, depth + 1)]);
+    const draw = (r) => (collapsed ? [this.compact(r, t)] : [this.row(r, t), ...drawAgents(reorderAgentRoots(this.byAgents.get(r.w.id) ?? [], this.agentOrders[r.w.id] ?? []))]);
     const remote = [...new Set([...rows.map(r => r.w.machine).filter(Boolean), ...this.machines.map(m => m.name), ...Object.keys(this.reconnecting)])].sort();
     const loading = m => {
       const layout = machines().find(k => k.name === m)?.layout;
@@ -492,7 +426,7 @@ export default class Spaces extends View {
       .flex_none()
       .justify_center()
       .rounded(8)
-      .when(on && !this.sliding, (el) => el.bg(t.selected))
+      .when(on, (el) => el.bg(t.selected))
       .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
       .when(this.pressed === w.id && this.over !== w.id, (el) => el.opacity(0.5))
       .when(this.pressed !== null && this.over === w.id && this.pressed !== w.id, (el) => el.child(
@@ -535,31 +469,75 @@ export default class Spaces extends View {
       );
   }
 
-  // A sub-agent's row: a 14 px cell per level, its line under the icon of the agent above.
-  agentRow({ a, lines, sub, paneless, name }, t) {
-    const program = a.program, st = paneless ? kidStatus(a.status) : a.status;
+  agentRow(a, t, depth = 0) {
+    const program = a.program, st = a.status;
+    const matches = depth === 0 ? spaces().flatMap(space => (space.tabs ?? [])
+      .filter(tab => tab.id === a.tab).map(tab => ({ space, tab }))) : [];
+    const target = matches.length === 1 && matches[0].space.id === a.space ? matches[0] : null;
+    const { tab } = target ?? {};
+    const paneMatches = tab ? panes().filter(p => p.tab === tab.id && p.pane === a.pane && p.terminal === a.address) : [];
+    const canCloseTab = Boolean(a.pane && target && paneMatches.length === 1);
     const pic = program?.icon ? (program.tint ? svg(program.icon).size(13).flex_none().text_color(t.dim) : image(program.icon).size(13).flex_none()) : div().size(5).mx(4).flex_none().rounded(3).bg(t.dim);
-    const cell = (l) => div().relative().w(14).h(AGENT_H).flex_none()
-      .when(l === "│" || l === "├", (el) => el.child(div().absolute().left(6).top(0).bottom(0).w(1.5).bg(t.input)))
-      .when(l === "└" || l === "├", (el) => el.child(div().absolute().left(6).top(0).w(6).h(AGENT_H / 2).border_l(1.5).border_b(1.5).border_color(t.input).rounded_bl(5)));
-    return h_flex().id(`agent-${a.address}`).h(AGENT_H).flex_none().pl(36).pr(8).items_center().rounded(8).cursor_pointer()
+    return h_flex().id(`agent-${a.address}`).h(AGENT_H).flex_none().pl(36 + depth * 14).pr(8).gap(8).items_center().rounded(8).cursor_pointer()
       .text_size(12.5).text_color(a.focused ? t.foreground : t.muted)
       .hover((s) => s.bg(t.hover).text_color(t.foreground)).active((s) => s.opacity(0.75))
-      // Without a pane there is nothing to focus: peek at it over the tab instead.
-      .on_click(() => (paneless ? run("terminal.peek", { terminal: a.address }) : run("pane.focus", { pane: a.pane })))
-      .children(lines.map(cell))
-      .child(div().mr(8).flex_none().child(pic))
-      .child(div().flex_1().min_w(0).mr(8).truncate().child(sub ? name || (paneless ? a.template || program?.name || a.address : agentName(a)) : agentName(a)))
+      .when(depth === 0, el => el
+        .relative()
+        .when(this.agentPressed === a.address && this.agentOver !== a.address, row => row.opacity(0.55).transition("opacity", { duration: 140, easing: "ease-out" }))
+        .child(div().absolute().left(7).right(7).bottom(0).h(2).rounded(1).bg(t.accent)
+          .opacity(this.agentPressed !== null && this.agentOver === a.address && this.agentPressed !== a.address ? 1 : 0)
+          .transition("opacity", { duration: 140, easing: "ease-out" }))
+        .on_mouse_down("left", () => { this.agentPressed = a.address; this.agentOver = a.address; })
+        .on_mouse_move((_e, cx) => {
+          if (this.agentPressed && this.agentOver !== a.address) { this.agentOver = a.address; cx.notify(); }
+        })
+        .on_mouse_up("left", (_e, cx) => {
+          const from = this.agentPressed, over = this.agentOver;
+          this.agentPressed = this.agentOver = null;
+          if (from && over === a.address && from !== a.address) {
+            const spaceId = a.space;
+            const roots = reorderAgentRoots(this.byAgents.get(spaceId) ?? [], this.agentOrders[spaceId] ?? []);
+            const order = roots.map(n => n.agent.address);
+            const source = order.indexOf(from), target = order.indexOf(over);
+            if (source !== -1 && target !== -1) {
+              order.splice(target, 0, order.splice(source, 1)[0]);
+              this.agentOrders[spaceId] = order;
+              localStorage.setItem("agents.orders", JSON.stringify(this.agentOrders));
+            }
+          }
+          cx.notify();
+        }))
+      .on_hover((hovered, cx) => {
+        if (hovered && this.hoveredAgent !== a.address) { this.hoveredAgent = a.address; cx.notify(); }
+        else if (!hovered && this.hoveredAgent === a.address) { this.hoveredAgent = null; cx.notify(); }
+      })
+      .on_click(() => a.pane ? run("pane.focus", { pane: a.pane }) : run("terminal.peek", { terminal: a.address }))
+      .when(depth > 0, el => el.child(div().text_color(t.dim).child("└")))
+      .child(pic)
+      .child(div().flex_1().min_w(0).truncate().child(agentName(a)))
+      .child(div().flex_none().text_size(10.5).text_color(t.dim).child(a.address))
       .when(st === "working", (el) => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
       .when(st === "blocked", (el) => el.child(div().flex_none().px(6).h(17).flex().items_center().rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).child("Needs you")))
-      .when(st === "done", (el) => el.child(div().size(6).mx(3).flex_none().rounded(3).bg(t.done)));
+      .when(st === "done", (el) => el.child(div().size(6).mx(3).flex_none().rounded(3).bg(t.done)))
+      .when(canCloseTab && this.hoveredAgent === a.address, el => el.child(div().id(`close-agent-tab-${a.address}`).flex_none().p(2).rounded(4)
+        .text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_click((_e, cx) => {
+          cx.stop_propagation();
+          openOverlay({ mod: "confirm", kind: "dialog", width: 360, height: 150, props: {
+            title: "Close this tab?",
+            detail: `This closes the entire “${tab.name}” tab, including all its terminals and agents.`,
+            command: { name: "tab.close", args: { id: tab.id } },
+          } });
+        })
+        .child(svg("mods/pane/close.svg").size(11))));
   }
 
-  // A new space starts in the New space dialog (huntaway-newspace): search or browse to its
-  // folder on that machine (null: this computer). No machine given (the top +): the shown space's.
+  // A new space on this computer starts in the New space dialog (huntaway-newspace-upstream): search or
+  // browse to its folder. Another machine's space starts in that machine's home, as before.
   newSpace(machine) {
-    const props = machine === undefined ? {} : { machine: machine ?? "" };
-    openOverlay({ mod: "huntaway-newspace", kind: "dialog", frame: "none", width: 520, height: 454, props });
+    if (machine) run("space.new", { machine });
+    else run("mod.open", { name: "huntaway-newspace-upstream" });
   }
 
   // The rail: each space is its colored letter tile, as in the full list; a dot on its corner
@@ -579,7 +557,7 @@ export default class Spaces extends View {
       .justify_center()
       .items_center()
       .tooltip(w.name)
-      .when(w.active && !this.sliding, (el) => el.bg(t.selected))
+      .when(w.active, (el) => el.bg(t.selected))
       .when(!w.active, (el) => el.hover((s) => s.bg(t.hover)))
       .active((s) => s.opacity(0.75))
       .on_click(() => run("space.select", { id: w.id }))
@@ -605,23 +583,19 @@ export default class Spaces extends View {
       changed = true;
     }
     if (changed) setShared("space.colors", kept);
-    this.byAgents = agentsBySpace();
+    this.byAgents = agentTreeBySpace(agents(), terminals());
     // agent.next / agent.prev follow the list as shown: space by space, top to bottom.
-    setAgentOrder(this.ordered().flatMap(r => (this.byAgents.get(r.w.id) ?? []).filter(x => !x.paneless).map(x => x.a.address)));
-    const slot = this.selectedSlot(collapsed);
-    this.sliding = Boolean(slot);
+    const agentAddresses = (nodes) => nodes.flatMap(n => [n.agent.address, ...agentAddresses(n.children)]);
+    setAgentOrder(this.ordered().flatMap(r => agentAddresses(this.byAgents.get(r.w.id) ?? [])));
     // Its own card: rounded to sit inside the layout node's 14 px corners and 1 px border.
     return v_flex().size_full().min_h(0).rounded(13).overflow_hidden().bg(glass(t.background)).text_size(13)
       .child(h_flex().h(31).pl(16).pr(10).items_center().justify_between().text_size(11.5).text_color(t.dim)
         .when(collapsed, el => el.pl(0).pr(0).justify_center())
         .when(!collapsed, el => el.child("Spaces"))
         .child(div().id("space-new").size(26).flex_none().flex().items_center().justify_center().rounded(6).hover(s => s.bg(t.hover).text_color(t.foreground))
-          .tooltip("New space").on_click((_e, cx) => this.newSpace()).child(svg("mods/workspace-chrome/plus.svg").size(14))))
+          .tooltip("New space").on_click((_e, cx) => this.newSpace(null)).child(svg("mods/workspace-chrome/plus.svg").size(14))))
       .child(v_flex().id("space-list").relative().flex_1().min_h(0).px(collapsed ? 0 : 8).pb(14).overflow_y_scrollbar().mode("always")
-        .on_mouse_up("left", (_e, cx) => { this.pressed = null; cx.notify(); })
-        // The selection slides from the space you left to the one you picked.
-        .when(Boolean(slot), el => el.child(div().id("space-selection").absolute().left(collapsed ? 4 : 8).right(collapsed ? 4 : 8).top(slot.y).h(slot.h).rounded(8).bg(t.selected)
-          .transition("top", { duration: 200, easing: "ease-out" })))
+        .on_mouse_up("left", (_e, cx) => { this.pressed = null; this.agentPressed = this.agentOver = null; cx.notify(); })
         .children(this.grouped(t, collapsed)))
       .when(collapsed && window()?.platform === "macos", (el) => el.child(h_flex().h(28).flex_none().items_center().justify_center()
         .child(div().id("unfold").text_size(13).text_color(t.dim).hover((s) => s.text_color(t.foreground)).on_click(toggleSidebar).child("»"))));
