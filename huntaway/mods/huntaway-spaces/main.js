@@ -92,6 +92,7 @@ export default class Spaces extends View {
     for (const state of Object.values(this.reconnecting)) state.busy = false;
     this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]"));
     this.agentOrders = JSON.parse(localStorage.getItem("agents.orders") ?? "{}");
+    this.foldedAgents = new Set(JSON.parse(localStorage.getItem("spaces.folded-agents") ?? "[]"));
     this.agentPressed = null;
     this.agentOver = null;
     this.refreshMachines(cx);
@@ -325,7 +326,12 @@ export default class Spaces extends View {
   grouped(t, collapsed) {
     const rows = this.ordered();
     const drawAgents = (nodes, depth = 0) => nodes.flatMap(n => [this.agentRow(n.agent, t, depth), ...drawAgents(n.children, depth + 1)]);
-    const draw = (r) => (collapsed ? [this.compact(r, t)] : [this.row(r, t), ...drawAgents(reorderAgentRoots(this.byAgents.get(r.w.id) ?? [], this.agentOrders[r.w.id] ?? []))]);
+    const draw = (r) => {
+      if (collapsed) return [this.compact(r, t)];
+      const roots = reorderAgentRoots(this.byAgents.get(r.w.id) ?? [], this.agentOrders[r.w.id] ?? []);
+      const folded = this.foldedAgents.has(r.w.id);
+      return [this.row(r, t, roots.length > 0, folded), ...(folded ? [] : roots.flatMap(n => [this.agentRow(n.agent, t), ...drawAgents(n.children, 1)]))];
+    };
     const remote = [...new Set([...rows.map(r => r.w.machine).filter(Boolean), ...this.machines.map(m => m.name), ...Object.keys(this.reconnecting)])].sort();
     const loading = m => {
       const layout = machines().find(k => k.name === m)?.layout;
@@ -412,7 +418,7 @@ export default class Spaces extends View {
       .when(g.behind > 0, (el) => el.child(div().flex_none().text_color(t.ansi1).child(`\u2193${g.behind}`)));
   }
 
-  row({ w, i, g, tree }, t) {
+  row({ w, i, g, tree }, t, hasAgents = false, folded = false) {
     const on = w.active;
     const fromIndex = this.pressed === null ? -1 : spaces().findIndex(s => s.id === this.pressed);
     const colors = shared("space.colors") ?? {};
@@ -454,7 +460,13 @@ export default class Spaces extends View {
         if (from !== null && over === w.id && from !== w.id) {
           const index = spaces().findIndex(s => s.id === w.id);
           if (index !== -1) run("space.move", { id: from, index: index + 1 });
-        } else if (from === w.id) run("space.select", { id: w.id });
+        } else if (from === w.id) {
+          run("space.select", { id: w.id });
+          if (hasAgents) {
+            folded ? this.foldedAgents.delete(w.id) : this.foldedAgents.add(w.id);
+            localStorage.setItem("spaces.folded-agents", JSON.stringify([...this.foldedAgents]));
+          }
+        }
         cx.notify();
       })
       .on_mouse_down("right", () => this.menu(w))
@@ -465,7 +477,17 @@ export default class Spaces extends View {
           .when(Boolean(tree), el => el.pl(22).child(svg("mods/workspace-chrome/branch.svg").size(13).text_color(t.dim)))
           .when(!tree, el => el.child(h_flex().size(18).flex_none().rounded(5).bg(fill).items_center().justify_center().text_size(10.5).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
           .child(div().flex_shrink(0).max_w(150).truncate().text_color(t.foreground).child(w.name))
-          .child(g ? this.gitTail(g, tree, w.name, t) : div().flex_1()),
+          .child(g ? this.gitTail(g, tree, w.name, t) : div().flex_1())
+          .when(hasAgents, el => el.child(div().id(`space-agents-toggle-${w.id}`).flex_none().w(18).h(20).flex().items_center().justify_center().rounded(4)
+            .tooltip(folded ? "Show agents" : "Hide agents").text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              folded ? this.foldedAgents.delete(w.id) : this.foldedAgents.add(w.id);
+              localStorage.setItem("spaces.folded-agents", JSON.stringify([...this.foldedAgents]));
+              cx.notify();
+            })
+            .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(11))))
       );
   }
 
