@@ -30,9 +30,13 @@ Left column, 268 px (folds to a 44 px rail; 76 on macOS):
     The agent in the selected tab has a quiet yellow 2 px marker at the left edge of its row.
   - An agent another agent started (`hc run`) sits under that agent instead, as a tree: 1.5 px
     `input`-colored lines (`├` `└` `│`) in a 14 px cell per level, under the icon above, and its
-    terminal name (`gl-228`). It is listed only there, never also as a row of its own, even when
-    it has a pane (in any space). Started agents without a pane (`hc run --bg`) show there too;
-    their `done` reads as idle (the parent's done is the news) and clicking one peeks at it.
+     terminal name (`gl-228`). It is listed only there, never also as a row of its own, even when
+     it has a pane (in any space). Started agents without a pane (`hc run --bg`) show there too;
+     their `done` reads as idle (the parent's done is the news) and clicking one peeks at it.
+   - Root agents from the same tab stay together. Their order matches the tab bar; dragging either
+     list keeps the other in step, while tabs without agents return to their original slots after sync.
+     If a move cannot be confirmed within five seconds, or the tab list changes three times mid-sync,
+     syncing pauses without replacing the saved order; a later drag in either list starts it again.
   - The selected space has a `selected` fill that slides (200 ms, ease-out) to the space you pick.
   - Folded to the rail: each space is its 22 px letter tile (dimmed unless selected), with a dot
     on its corner when an agent there is working, done or blocked; the selection slides there too.
@@ -45,8 +49,13 @@ Right of that, the work column:
     The lifted card slides (200 ms) to the tab you pick.
   - Dragging a tab shows a 2 px yellow line that slides to where it will land; the dragged tab fades.
   - A tab whose agent is blocked breathes: a `blocked` glow pulsing slowly (2.2 s).
-  - When tabs don't fit, the others shrink to their icon, then only the run around the active one shows.
-  - `+` is its own 38 px card right after the tabs (Herdr's new-tab menu).
+  - Inactive tabs shrink to their icon when the measured available width is exceeded. When they
+    fit, the card keeps its content width and a non-scrolling `+` card follows immediately. Only
+    when the measured row overflows does the tab card fill the remaining viewport and gain a
+    horizontal scrollbar; switching tabs scrolls the active one into view. Line-based horizontal
+    wheel movement accumulates to an off-screen tab before scrolling; pixel-based trackpad movement
+    and direct scrollbar dragging keep native fine-grained scrolling. Vertical wheel movement also
+    accumulates before changing tabs. The right controls stay fixed at the far edge.
   - On the right, one card: the bell (only when `huntaway-inbox` is installed), Files, Changes, a
     divider, and on Windows and Linux minimize, maximize and close (close turns `#e81123` under
     the pointer). The open panel's button has the same lifted yellow card, sliding between Files
@@ -104,8 +113,10 @@ Clicking a row focuses that agent. Empty, it says "All caught up".
   - `huntaway-spaces` (clone of `spaces`): cards, agents under spaces (`agents()`,
     sub-agents nested by `terminals()`' `parent`, `setAgentOrder` in the order shown), the sliding selection, the rail tiles, `+` runs
     `mod.open {name: "huntaway-newspace"}` (another machine: `space.new {machine}`).
-  - `huntaway-tabs` (written for this layout): the tab card, sliding selection and drag line
-    (`transition`), the breathing blocked tab (`loop`), the right-hand card, per-space panel memory.
+  - `huntaway-tabs` (written for this layout): the shrink-wrapped, measured tab card with horizontal
+    overflow scrolling, sliding selection and drag line (`transition`), the breathing blocked tab
+    (`loop`), the right-hand card, per-space panel memory. `fit-tabs.js` holds the pure sizing and
+    drop-marker index calculations.
     It shows the bell only while `mods/huntaway-inbox/mod.json` exists (`readTextFile`,
     `watchFolder` on `mods/`).
   - `huntaway-inbox`: the bell's popup, opened with `frame: "none"` under the right-hand card and
@@ -138,6 +149,9 @@ Clicking a row focuses that agent. Empty, it says "All caught up".
 - `herdr-app shot` shows cards with 14 px corners on the wallpaper, agents under their spaces, the
   tab card with the selected tab lifted in yellow, and the right-hand card.
 - Selecting another tab or space slides the selection there.
+- In a narrow window or with many tabs, the tab card stays within the measured space, scrolls
+  horizontally to reach every tab, and keeps `+` and the right controls visible.
+- Dragging tabs in an overflowing row places the drop marker at the correct absolute tab index.
 - An agent reporting `blocked` shows `Needs you` under its space, a breathing tab, and the bell's
   count; the bell's popup lists it and clicking it focuses that pane.
 - Switching to a light theme swaps in `mist-light.jpg` and dark rims; switching back restores them.

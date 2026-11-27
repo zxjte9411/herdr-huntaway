@@ -7,7 +7,7 @@
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, machines, panes, agents, terminals, setAgentOrder, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
-import { agentTreeBySpace, reorderAgentRoots } from "./agent-tree.js";
+import { agentTabSyncNeedsWake, agentTreeBySpace, reorderAgentRoots, groupAgentRootsByTab, orderAgentRootsByTabs, syncAgentTabOrder, resumeAfterTabGesture } from "./agent-tree.js";
 
 // Frosted glass on dark themes: card fills let the blurred wallpaper through. Light themes stay
 // nearly solid, so terminal text keeps its contrast on white.
@@ -92,6 +92,9 @@ export default class Spaces extends View {
     for (const state of Object.values(this.reconnecting)) state.busy = false;
     this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]"));
     this.agentOrders = JSON.parse(localStorage.getItem("agents.orders") ?? "{}");
+    this.agentTabSync = {};
+    this.agentTabDragRevision = shared("huntaway.agent-tab-drag")?.revision ?? null;
+    this.pendingAgentTabGesture = null;
     this.foldedAgents = new Set(JSON.parse(localStorage.getItem("spaces.folded-agents") ?? "[]"));
     this.agentPressed = null;
     this.agentOver = null;
@@ -107,7 +110,9 @@ export default class Spaces extends View {
     for (const s of sp) if (!this.shown.has(s.id)) this.born[s.id] ??= now;
     const due = this.due(now, sp, panes());
     if (due.size) this.refreshGit(due, cx);
-    if (sp.some((s) => !this.shown.has(s.id)) || this.orderingDue(now)) cx.notify();
+    const activeSync = this.agentTabSync[sp.find(s => s.active)?.id];
+    if (sp.some((s) => !this.shown.has(s.id)) || this.orderingDue(now)
+      || agentTabSyncNeedsWake(activeSync, now)) cx.notify();
   }
 
   // Places whose git could have changed: new ones (a new space, a cd), where a
@@ -282,6 +287,35 @@ export default class Spaces extends View {
       && this.ordering.machines.every(name => machines().some(m => m.name === name && m.layout === "ready"));
   }
 
+  syncAgentTabs(spaceId, addresses) {
+    const space = spaces().find(s => s.id === spaceId);
+    if (!space) return;
+    const gesture = shared("huntaway.agent-tab-drag");
+    if (gesture?.revision != null && gesture.revision !== this.agentTabDragRevision) {
+      this.agentTabDragRevision = gesture.revision;
+      if (gesture.space === spaceId) this.pendingAgentTabGesture = gesture;
+    }
+    if (!space.active) {
+      if (!this.agentTabSync[spaceId]?.pending) this.agentTabSync[spaceId] = {};
+      return;
+    }
+    const resumed = resumeAfterTabGesture(space.tabs ?? [], spaceId, this.agentTabSync[spaceId], this.pendingAgentTabGesture);
+    if (resumed !== this.agentTabSync[spaceId]) {
+      this.pendingAgentTabGesture = null;
+      this.agentTabSync[spaceId] = resumed;
+    }
+    const result = syncAgentTabOrder(space.tabs ?? [], this.byAgents.get(spaceId) ?? [], addresses, this.agentTabSync[spaceId]);
+    this.agentTabSync[spaceId] = result.state;
+    if (!result.waiting && !result.aborted && JSON.stringify(result.addresses) !== JSON.stringify(this.agentOrders[spaceId] ?? [])) {
+      this.agentOrders[spaceId] = result.addresses;
+      localStorage.setItem("agents.orders", JSON.stringify(this.agentOrders));
+    } else if (!result.waiting && !result.aborted && !this.agentOrders[spaceId] && result.addresses.length) {
+      this.agentOrders[spaceId] = result.addresses;
+      localStorage.setItem("agents.orders", JSON.stringify(this.agentOrders));
+    }
+    for (const move of result.moves) run("tab.move", { id: move.id, index: move.index });
+  }
+
   // Spaces in order, each worktree space moved under its main checkout's.
   ordered() {
     const sp = spaces(), ps = panes();
@@ -328,7 +362,10 @@ export default class Spaces extends View {
     const drawAgents = (nodes, depth = 0) => nodes.flatMap(n => [this.agentRow(n.agent, t, depth), ...drawAgents(n.children, depth + 1)]);
     const draw = (r) => {
       if (collapsed) return [this.compact(r, t)];
-      const roots = reorderAgentRoots(this.byAgents.get(r.w.id) ?? [], this.agentOrders[r.w.id] ?? []);
+      const nodes = this.byAgents.get(r.w.id) ?? [];
+      const roots = this.agentTabSync[r.w.id]?.initialized
+        ? orderAgentRootsByTabs(nodes, r.w.tabs ?? [], this.agentOrders[r.w.id] ?? [])
+        : groupAgentRootsByTab(nodes, this.agentOrders[r.w.id] ?? []);
       const folded = this.foldedAgents.has(r.w.id);
       return [this.row(r, t, roots.length > 0, folded), ...(folded ? [] : roots.flatMap(n => [this.agentRow(n.agent, t), ...drawAgents(n.children, 1)]))];
     };
@@ -523,10 +560,13 @@ export default class Spaces extends View {
             const roots = reorderAgentRoots(this.byAgents.get(spaceId) ?? [], this.agentOrders[spaceId] ?? []);
             const order = roots.map(n => n.agent.address);
             const source = order.indexOf(from), target = order.indexOf(over);
-            if (source !== -1 && target !== -1) {
+            if (source !== -1 && target !== -1 && !this.agentTabSync[spaceId]?.pending) {
               order.splice(target, 0, order.splice(source, 1)[0]);
-              this.agentOrders[spaceId] = order;
+              const grouped = groupAgentRootsByTab(this.byAgents.get(spaceId) ?? [], order);
+              this.agentOrders[spaceId] = grouped.map(n => n.agent.address);
               localStorage.setItem("agents.orders", JSON.stringify(this.agentOrders));
+              this.agentTabSync[spaceId] = {};
+              this.syncAgentTabs(spaceId, this.agentOrders[spaceId]);
             }
           }
           cx.notify();
@@ -608,6 +648,11 @@ export default class Spaces extends View {
     }
     if (changed) setShared("space.colors", kept);
     this.byAgents = agentTreeBySpace(agents(), terminals());
+    for (const s of sp) {
+      if (s.active) {
+        this.syncAgentTabs(s.id, this.agentOrders[s.id] ?? []);
+      }
+    }
     // agent.next / agent.prev follow the list as shown: space by space, top to bottom.
     const agentAddresses = (nodes) => nodes.flatMap(n => [n.agent.address, ...agentAddresses(n.children)]);
     setAgentOrder(this.ordered().flatMap(r => agentAddresses(this.byAgents.get(r.w.id) ?? [])));

@@ -19,8 +19,11 @@ Made for Windows and macOS. Linux should work but is untested.
 
 - Frosted cards over a soft wallpaper, in a dark and a light version that follow your theme.
 - Tabs and spaces have a selection that slides as you switch. Drag tabs to reorder them.
+- The tab card shrinks to its contents when there's room; only when tabs overflow does it become scrollable. `+` follows the card and the right-hand controls stay fixed.
+- Wheel gestures accumulate before switching tabs or moving the overflowed tab row; pixel-based trackpad scrolling stays native and fine-grained.
 - Each space lists its agents underneath, with what they're doing. Agents another agent started
   sit under it as a tree, listed once.
+- Agents from the same tab stay together; reordering agent tabs or sidebar rows keeps both lists in step and restores ordinary tabs to their original slots.
 - The agent in the selected tab has a subtle marker in the list.
 - Each pane's header shows its terminal's address (`t38`). Click it to copy the address and
   paste it to an agent, which can read that terminal with `hc read t38`.

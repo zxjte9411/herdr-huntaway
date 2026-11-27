@@ -3,9 +3,12 @@
 // through. The tabs share one card on the left, then +; the agent inbox bell, the Files and
 // Changes panels and the window buttons share one card on the right.
 import { View, div, svg, image } from "gpui-kit";
-import { h_flex } from "gpui-base";
-import { spaces, panes, agents, run, openOverlay, theme, window, shared, layout, settings, appHome, readTextFile, watchFolder } from "herdr";
+import { h_flex, ScrollHandle } from "gpui-base";
+import { spaces, panes, agents, run, openOverlay, theme, window, shared, setShared, layout, settings, appHome, readTextFile, watchFolder } from "herdr";
 import { tabLabel } from "./title-label.js";
+import { tabDragGesture } from "./drag-gesture.js";
+import { dropMarkerIndex, fitTabs } from "./fit-tabs.js";
+import { nextScrollIndex, wheelInput, wheelSteps } from "./scroll-input.js";
 
 // Frosted glass on dark themes: card fills let the blurred wallpaper through. Light themes stay
 // nearly solid, so terminal text keeps its contrast on white.
@@ -37,10 +40,15 @@ const waitingAgents = () => agents()
 
 export default class Tabs extends View {
   init(_props, cx) {
+    this.tabDragRevision = Date.now();
     this.pressed = null; // the tab index under a held button
     this.over = null; // the tab the pointer is over while one is held: a drag
     this.inbox = false;
     this.widths = {}; // measured tab widths, for placing the sliding selection
+    this.scroll = ScrollHandle.new();
+    this.activeTab = null;
+    this.verticalWheel = 0;
+    this.horizontalWheel = 0;
     try { this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}"); } catch { this.panels = {}; }
     // The bell shows only while the inbox mod is installed: look now and whenever mods/ changes.
     const mods = `${appHome()}/mods`;
@@ -84,23 +92,6 @@ export default class Tabs extends View {
 
   dragging() { return this.pressed !== null && this.over !== null && this.over !== this.pressed; }
 
-  // Which tabs fit. All at full width when they can; otherwise the others shrink to
-  // their icon, and if even that is too wide, the run around the active tab that fits.
-  // The wheel and the faded edge tabs reach the rest.
-  fit(tabs, width, room) {
-    const full = tabs.map(c => width(c, false));
-    if (!room || full.reduce((n, w) => n + w + TAB_GAP, -TAB_GAP) <= room) return { compact: false, from: 0, to: tabs.length };
-    const w = tabs.map((c, i) => c.active ? full[i] : width(c, true));
-    const a = Math.max(0, tabs.findIndex(c => c.active));
-    let from = a, to = a + 1, used = w[a] ?? 0, grew = true;
-    while (grew) {
-      grew = false;
-      if (to < tabs.length && used + TAB_GAP + w[to] <= room) { used += TAB_GAP + w[to]; to++; grew = true; }
-      if (from > 0 && used + TAB_GAP + w[from - 1] <= room) { from--; used += TAB_GAP + w[from]; grew = true; }
-    }
-    return { compact: true, from, to: Math.max(to, from + 1) };
-  }
-
   render() {
     const t = theme();
     const space = spaces().find(p => p.active);
@@ -119,13 +110,21 @@ export default class Tabs extends View {
     };
     // Mods can't measure text: about 6.4 px a character at 12.5 px.
     const width = (c, compact) => {
+      const measured = this.widths[`${c.id}:${compact}`];
+      if (measured !== undefined) return measured;
       const { program, name } = info(c);
       if (compact) return 24 + (program?.icon ? 14 : 9);
       const status = ["working", "blocked", "done"].includes(c.status) ? 20 : 0;
       return 26 + (program?.icon ? 21 : 0) + Math.min(name.length * 6.4, 170) + status + (c.active ? 20 : 0);
     };
-    const room = this.room ? this.room - 38 - GAP - 2 * INSET - 2 : 0; // leave room for + and the group's edge
-    const fit = this.fit(shown, width, room);
+    const room = this.room === undefined || this.plusWidth === undefined ? 0
+      : Math.max(0, this.room - this.plusWidth - GAP - 2 * INSET - 2);
+    const fit = fitTabs(shown, width, room, TAB_GAP);
+    const activeIndex = shown.findIndex(c => c.active);
+    if (fit.overflow && activeIndex >= 0 && this.activeTab !== shown[activeIndex].id) {
+      this.activeTab = shown[activeIndex].id;
+      this.scroll.scroll_to_item(activeIndex);
+    }
 
     const item = (c, i, compact, faded) => {
       const { program, name } = info(c);
@@ -140,11 +139,23 @@ export default class Tabs extends View {
         .when(this.dragging() && this.pressed === i, el => el.opacity(0.4))
         .on_mouse_move((_e, cx) => { if (this.pressed !== null && this.over !== i) { this.over = i; cx.notify(); } })
         .when(!on, el => el.hover(s => s.bg(t.hover).text_color(t.foreground))).active(s => s.opacity(0.75))
-        .on_size_change((sz, cx) => { const n = Math.round(sz.width); if (this.widths[c.id] !== n) { this.widths[c.id] = n; cx.notify(); } })
+        .on_size_change((sz, cx) => {
+          const key = `${c.id}:${compact}`;
+          const n = Math.round(sz.width / settings().zoom);
+          if (this.widths[key] !== n) { this.widths[key] = n; cx.notify(); }
+        })
         .on_mouse_down("left", (e, cx) => { cx.stop_propagation(); this.pressed = i; this.over = i; if (e.click_count === 2) run("tab.rename", { id: c.id }); })
         .on_mouse_up("left", (_e, cx) => {
           const from = this.pressed; this.pressed = null; this.over = null;
-          if (from !== null && from !== i) run("tab.move", { id: shown[from].id, index: space.tabs.findIndex(x => x.id === c.id) + 1 });
+          if (from !== null && from !== i) {
+            const source = shown[from], target = space.tabs.findIndex(x => x.id === c.id);
+            const gesture = tabDragGesture(space, source.id, c.id,
+              this.tabDragRevision = Math.max(Date.now(), this.tabDragRevision + 1));
+            if (gesture) {
+              setShared("huntaway.agent-tab-drag", gesture);
+              run("tab.move", { id: source.id, index: target + 1 });
+            }
+          }
           else run("tab.select", { id: c.id });
           cx.notify();
         })
@@ -157,28 +168,53 @@ export default class Tabs extends View {
         .when(on, el => el.child(div().id(`close-${c.id}`).flex_none().p(2).rounded(4).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
           .on_mouse_down("left", stop).on_click((_e, cx) => { cx.stop_propagation(); run("tab.close", { id: c.id }); }).child(svg("mods/pane/close.svg").size(12))));
     };
-    const visible = shown.slice(fit.from, fit.to);
+    const visible = shown;
     // While dragging, a line slides to where the tab will land: after the hovered tab when
     // moving right, before it when moving left.
-    const before = k => { let px = INSET; for (let j = 0; j < k; j++) px += (this.widths[visible[j].id] ?? width(visible[j], fit.compact)) + TAB_GAP; return px; };
+    const before = k => { let px = INSET; for (let j = 0; j < k; j++) px += width(visible[j], fit.compact && !visible[j].active) + TAB_GAP; return px; };
     let marker = null;
     if (this.dragging()) {
-      const from = this.pressed - fit.from, to = this.over - fit.from;
-      if (to >= 0 && to < visible.length) {
-        const edge = from < to ? before(to + 1) - TAB_GAP : before(to);
+      const from = this.pressed, to = this.over;
+      if (from >= 0 && from < visible.length && to >= 0 && to < visible.length) {
+        const edge = before(dropMarkerIndex(from, to)) - (from < to ? TAB_GAP : 0);
         marker = div().id("tab-drop").absolute().top(INSET + 5).bottom(INSET + 5).left(edge - 2).w(2).rounded(1).bg(lit)
           .transition("left", { duration: 120, easing: "ease-out" });
       }
     }
-    const group = card(h_flex().id("tab-group").relative().h_full().min_w(0).p(INSET).gap(TAB_GAP).items_center())
+    const group = card(h_flex().id(fit.overflow ? "tab-group-overflow" : "tab-group").relative().flex_none().h_full().p(INSET).gap(TAB_GAP).items_center()
+      .when(fit.overflow, el => el.flex_1().min_w(0).overflow_x_scrollbar().track_scroll(this.scroll)
+        .on_scroll_wheel((e, cx) => {
+          const delta = e.delta_lines?.x;
+          if (!delta) return; // pixel-based trackpad scrolling stays native and fine-grained.
+          cx.stop_propagation();
+          const { steps, remainder } = wheelSteps(delta, this.horizontalWheel, 4);
+          this.horizontalWheel = remainder;
+          if (!steps) return;
+          const target = nextScrollIndex(
+            visible.map(c => width(c, fit.compact && !c.active)),
+            this.scroll.offset().x,
+            this.scroll.viewport_size().width,
+            steps,
+            Math.abs(steps),
+            TAB_GAP,
+            INSET,
+          );
+          if (target !== null) this.scroll.scroll_to_item(target);
+        })))
       .when(Boolean(marker), el => el.child(marker))
-      .children(visible.map((c, k) => {
-        const i = fit.from + k;
-        return item(c, i, fit.compact && !c.active, (k === 0 && fit.from > 0) || (i === fit.to - 1 && fit.to < shown.length));
-      }));
+      .children(visible.map((c, i) => item(c, i, fit.compact && !c.active, false)));
     const plus = card(div().id("tab-new").h_full().w(38).flex_none().flex().items_center().justify_center().text_size(16).text_color(t.muted))
       .hover(s => s.bg(t.hover).text_color(t.foreground)).active(s => s.opacity(0.7)).tooltip("New tab")
+      .on_size_change((s, cx) => {
+        const n = Math.floor(s.width / settings().zoom);
+        if (n !== this.plusWidth) { this.plusWidth = n; cx.notify(); }
+      })
       .on_mouse_down("left", stop).on_click(() => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })).child("+");
+    const viewport = h_flex().id("tab-viewport").flex_1().min_w(0).h_full().gap(GAP).items_center()
+      .on_size_change((s, cx) => {
+        const n = Math.floor(s.width / settings().zoom);
+        if (n !== this.room) { this.room = n; cx.notify(); }
+      }).when(visible.length > 0, el => el.child(group)).child(plus);
 
     const root = layout(), sidebar = find(root, "sidebar"), w = window();
     // On macOS with the sidebar folded, the tabs start after the traffic lights.
@@ -256,11 +292,13 @@ export default class Tabs extends View {
       .on_mouse_up("left", (_e, cx) => { if (this.pressed !== null) { this.pressed = null; this.over = null; cx.notify(); } })
       // A drag that leaves the bar is dropped where it started.
       .on_hover((hovered, cx) => { if (!hovered && this.pressed !== null) { this.pressed = null; this.over = null; cx.notify(); } })
-      .on_scroll_wheel(e => { if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next"); })
-      .child(h_flex().id("tab-strip").flex_1().min_w(0).h_full().gap(GAP).items_center()
-        .on_size_change((s, cx) => { const n = Math.floor(s.width); if (n !== this.room) { this.room = n; cx.notify(); } })
-        .when(visible.length > 0, el => el.child(group))
-        .child(plus))
+      .on_scroll_wheel(e => {
+        const input = wheelInput(e, "y");
+        const { steps, remainder } = wheelSteps(input.delta, this.verticalWheel, input.threshold);
+        this.verticalWheel = remainder;
+        for (let i = 0; i < Math.abs(steps); i++) run(steps > 0 ? "tab.prev" : "tab.next");
+      })
+      .child(h_flex().id("tab-strip").flex_1().min_w(0).h_full().items_center().child(viewport))
       .when(hasActions, el => el.child(actions));
   }
 }
